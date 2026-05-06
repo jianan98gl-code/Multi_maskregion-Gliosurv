@@ -83,6 +83,17 @@ class ViT3DTrainer(BaseTrainer):
         else:
             raise ValueError(f"Dataloader has been created. Do not create twice.")
 
+    @staticmethod
+    def _as_1d_tensor(value, dtype=None, device=None):
+        if not torch.is_tensor(value):
+            value = torch.tensor(value)
+        value = value.reshape(-1)
+        if dtype is not None:
+            value = value.to(dtype=dtype)
+        if device is not None:
+            value = value.to(device=device)
+        return value
+
     def run(self):
         args = self.args
         niters = args.start_epoch * self.iters_per_epoch
@@ -143,12 +154,12 @@ class ViT3DTrainer(BaseTrainer):
             self.adjust_learning_rate(epoch + i / self.iters_per_epoch, args)
             
             image = batch_data['input']
-            event = batch_data['death_event']
-            duration = batch_data['death_duration_month']
+            event = self._as_1d_tensor(batch_data['death_event'], dtype=torch.bool)
+            duration = self._as_1d_tensor(batch_data['death_duration_month'], dtype=torch.float32)
             
             if event.sum().item() == 0:
                 event_data = train_dataset.get_event_data()
-                random_idx = torch.randint(0, len(event), (1,))
+                random_idx = torch.randint(0, image.size(0), (1,), device=event.device)
                 
                 image[random_idx] = event_data['input']
                 event[random_idx] = event_data['death_event']
@@ -160,7 +171,7 @@ class ViT3DTrainer(BaseTrainer):
                 event = event.cuda(args.gpu, non_blocking=True)
                 duration = duration.cuda(args.gpu, non_blocking=True)
 
-            loss = self.train_class_batch(model, image, event, duration)
+            loss, region_weights = self.train_class_batch(model, image, event, duration)
 
             optimizer.zero_grad()
             loss.backward()
@@ -175,11 +186,19 @@ class ViT3DTrainer(BaseTrainer):
 
                 pbar.set_description(f'Train Epoch {epoch:03d}/{args.epochs} | Iter {i:05d}/{self.iters_per_epoch} | Init Lr {self.lr:.03f} | Lr {last_layer_lr:.03f} | Loss {loss.item():.03f}')
                 if args.rank == 0:
-                    wandb.log(
-                        {
+                    log_dict = {
                         "lr": last_layer_lr,
                         "Loss": loss.item(),
-                        },
+                    }
+                    if region_weights is not None:
+                        train_region_weight_mean = region_weights.mean(dim=0) if region_weights.ndim == 2 else region_weights
+                        log_dict.update({
+                            "region_weight_necrosis": train_region_weight_mean[0].item(),
+                            "region_weight_edema": train_region_weight_mean[1].item(),
+                            "region_weight_enhancing": train_region_weight_mean[2].item(),
+                        })
+                    wandb.log(
+                        log_dict,
                         step=niters,
                     )
                     
@@ -188,9 +207,11 @@ class ViT3DTrainer(BaseTrainer):
 
     @staticmethod
     def train_class_batch(model, samples, event, duration):
-        log_params = model(samples)
+        log_params, region_weights = model(samples)
+        event = event.reshape(-1)
+        duration = duration.reshape(-1)
         loss = neg_log_likelihood(log_params, event, duration, reduction="mean")
-        return loss
+        return loss, region_weights.detach()
     
     @torch.no_grad()
     def evaluate(self, epoch, niters):
@@ -204,27 +225,26 @@ class ViT3DTrainer(BaseTrainer):
         log_params_list = []
         event_list = []
         time_list = []
+        region_weight_list = []
 
         pbar = tqdm(enumerate(val_loader), total=len(val_loader), position=0, leave=False)
         for i, batch_data in pbar:
             image = batch_data['input']
-            event = batch_data['death_event']
-            duration = batch_data['death_duration_month']
+            event = self._as_1d_tensor(batch_data['death_event'], dtype=torch.bool)
+            duration = self._as_1d_tensor(batch_data['death_duration_month'], dtype=torch.float32)
 
             if args.gpu is not None:
                 image = image.as_tensor().to(args.gpu, non_blocking=True)
                 event = event.to(args.gpu, non_blocking=True)
                 duration = duration.to(args.gpu, non_blocking=True)
                 
-            output = model(image)
-            loss = neg_log_likelihood(output, event, duration, reduction="mean")
+            output, region_weights = model(image)
             
             log_params_list.append(output)
-            event_list.append(event)
-            time_list.append(duration)
+            event_list.append(event.reshape(-1))
+            time_list.append(duration.reshape(-1))
+            region_weight_list.append(region_weights)
 
-            batch_size = image.size(0)
-            meters['loss'].update(value=loss.item(), n=batch_size)
 
         if args.distributed:
             for k, v in meters.items():
@@ -233,17 +253,25 @@ class ViT3DTrainer(BaseTrainer):
         log_params_list = concat_all_gather(torch.cat(log_params_list, dim=0), args.distributed).cpu()
         event_list = concat_all_gather(torch.cat(event_list, dim=0), args.distributed).cpu()
         time_list = concat_all_gather(torch.cat(time_list, dim=0), args.distributed).cpu()
+        region_weight_list = concat_all_gather(torch.cat(region_weight_list, dim=0), args.distributed).cpu()
+        loss = neg_log_likelihood(log_params_list, event_list, time_list, reduction="mean")
+        meters['loss'].update(value=loss.item(), n=event_list.shape[0])
         log_hz_list = log_hazard(log_params_list, time_list)
+        region_weight_mean = region_weight_list.mean(dim=0)
 
         c_index = self.cox_cindex(log_hz_list, event_list, time_list).item()
 
         pbar.set_description(f'Val Epoch {epoch:03d}/{args.epochs} | Loss {meters["loss"].global_avg:.03f} | C-Index {c_index:.03f}')
         if args.rank == 0:
-            wandb.log(
-                {
+            log_dict = {
                  "Val Loss": meters['loss'].global_avg,
                  "C-Index": c_index,
-                },
+                 "Val region_weight_necrosis": region_weight_mean[0].item(),
+                 "Val region_weight_edema": region_weight_mean[1].item(),
+                 "Val region_weight_enhancing": region_weight_mean[2].item(),
+            }
+            wandb.log(
+                log_dict,
                 step=niters,
             )
             

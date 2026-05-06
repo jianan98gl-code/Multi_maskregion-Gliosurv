@@ -190,12 +190,16 @@ class LayerDecayValueAssigner(object):
         print(f"LayerDecayValueAssigner: {self.values}")
 
     def get_scale(self, layer_id, prefix=''):
-        if layer_id is not None:
+        # If prefix is unknown or layer_id is None, fall back to scale 1
+        if layer_id is not None and prefix in self.values:
             return self.values[prefix][layer_id]
         else:
             return 1
 
     def get_layer_id(self, var_name, prefix=''):
+        # If prefix not defined in values, return None so it will use default group/scale
+        if prefix not in self.values:
+            return None
         return get_vit_layer_id(var_name, len(self.values[prefix]), prefix)
 
 

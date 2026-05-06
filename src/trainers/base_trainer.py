@@ -95,7 +95,11 @@ class BaseTrainer(object):
                 
             if get_layer_id is not None:
                 layer_id = get_layer_id(name, prefix=prefix)
-                group_name = "%s_layer_%d_%s" % (prefix, layer_id, group_name)
+                # If layer_id is None (unknown prefix), don't include layer index in group name
+                if layer_id is None:
+                    group_name = "%s_%s" % (prefix, group_name)
+                else:
+                    group_name = "%s_layer_%d_%s" % (prefix, layer_id, group_name)
             else:
                 layer_id = None
 
